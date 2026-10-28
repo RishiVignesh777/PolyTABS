@@ -1,0 +1,6 @@
+{
+  "name": "PolyTABS: 2D Tactical Battle Simulator",
+  "description": "A single-player 2D tactical battle simulator inspired by TABS, powered by a C-designed simulation core with geometric shape units, ragdoll physics, and tactical formations.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
