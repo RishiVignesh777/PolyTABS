@@ -1,6 +1,13 @@
 /**
  * PolyTABS - 2D Tactical Battle Simulator Engine
- * Pure C Core Simulation Implementation
+ * Core C Simulation Implementation
+ * 
+ * Uses and builds directly upon the foundational reference implementation:
+ * - get_distance()
+ * - find_nearest_enemy()
+ * - update_unit()
+ * - has_army_lost()
+ * - simulate_battle_step()
  */
 
 #include "battle_engine.h"
@@ -9,49 +16,58 @@
 #include <stdlib.h>
 
 #ifndef M_PI
-#define M_PI 3.14159265358979323846
+#define M_PI 3.14159265358979323846f
 #endif
 
-/* Simulation Memory Pools */
-static Unit        g_units[MAX_UNITS];
+/* Global Armies and Simulation State */
+static Army        g_player_army;
+static Army        g_enemy_army;
 static Projectile  g_projectiles[MAX_PROJECTILES];
-static SimEvent     g_events[MAX_EVENTS];
+static int         g_projectile_count = 0;
+static SimEvent    g_events[MAX_EVENTS];
+static int         g_event_count = 0;
 static BattleState g_state;
-static uint32_t    g_next_unit_id = 1;
-static uint32_t    g_next_proj_id = 1;
-static uint32_t    g_event_count  = 0;
+static int         g_next_id = 1;
 
-/* Internal Math Helpers */
-static inline float vec2_dist_sq(Vec2 a, Vec2 b) {
-    float dx = a.x - b.x;
-    float dy = a.y - b.y;
-    return dx * dx + dy * dy;
+/* --------------------------------------------------------------------------
+ * 1. Foundational Reference Functions
+ * -------------------------------------------------------------------------- */
+
+float get_distance(float x1, float y1, float x2, float y2) {
+    float dx = x2 - x1;
+    float dy = y2 - y1;
+    return sqrtf(dx * dx + dy * dy);
 }
 
-static inline float vec2_dist(Vec2 a, Vec2 b) {
-    return sqrtf(vec2_dist_sq(a, b));
-}
+Unit* find_nearest_enemy(Unit* current_unit, Army* enemy_army) {
+    Unit* nearest = NULL;
+    float min_dist = 99999.0f;
 
-static inline Vec2 vec2_norm(Vec2 v) {
-    float len = sqrtf(v.x * v.x + v.y * v.y);
-    if (len > 0.0001f) {
-        Vec2 r = { v.x / len, v.y / len };
-        return r;
+    for (int i = 0; i < enemy_army->count; i++) {
+        Unit* enemy = &enemy_army->units[i];
+        if (!enemy->is_alive) continue;
+
+        float dist = get_distance(current_unit->x, current_unit->y, enemy->x, enemy->y);
+
+        /* Extended Tactical Behavior: Cavalry (Circle) prioritizes archers & sorcerers */
+        if (current_unit->type == UNIT_CIRCLE) {
+            if (enemy->type == UNIT_TRIANGLE || enemy->type == UNIT_STAR) {
+                dist *= 0.45f; // Bias towards backline ranged targets
+            }
+        }
+
+        if (dist < min_dist) {
+            min_dist = dist;
+            nearest = enemy;
+        }
     }
-    Vec2 zero = { 0.0f, 0.0f };
-    return zero;
+    return nearest;
 }
 
-static inline float clampf(float val, float min, float max) {
-    if (val < min) return min;
-    if (val > max) return max;
-    return val;
-}
-
-static void emit_event(SimEventType type, uint32_t src, uint32_t tgt, float x, float y, float val) {
+static void emit_sim_event(int type, int src, int tgt, float x, float y, float val) {
     if (g_event_count < MAX_EVENTS) {
         SimEvent* e = &g_events[g_event_count++];
-        e->type = (uint32_t)type;
+        e->type = type;
         e->source_id = src;
         e->target_id = tgt;
         e->x = x;
@@ -60,93 +76,406 @@ static void emit_event(SimEventType type, uint32_t src, uint32_t tgt, float x, f
     }
 }
 
-/* Base Archetype Initializer */
-static void init_unit_stats(Unit* u, UnitType type, Team team, float x, float y, float angle) {
-    u->id = g_next_unit_id++;
-    u->type = (uint8_t)type;
-    u->team = (uint8_t)team;
-    u->state = (uint8_t)STATE_IDLE;
-    u->is_active = 1;
+static void spawn_projectile(int src_id, Team team, UnitType src_type, float x, float y, float tx, float ty, float dmg, float speed, float splash) {
+    if (g_projectile_count >= MAX_PROJECTILES) return;
 
-    u->pos.x = x;
-    u->pos.y = y;
-    u->vel.x = 0.0f;
-    u->vel.y = 0.0f;
-    u->force.x = 0.0f;
-    u->force.y = 0.0f;
+    float dx = tx - x;
+    float dy = ty - y;
+    float len = sqrtf(dx * dx + dy * dy);
+    if (len <= 0.0001f) len = 1.0f;
+
+    Projectile* p = &g_projectiles[g_projectile_count++];
+    p->id = g_next_id++;
+    p->team = team;
+    p->source_type = src_type;
+    p->x = x;
+    p->y = y;
+    p->vx = (dx / len) * speed;
+    p->vy = (dy / len) * speed;
+    p->damage = dmg;
+    p->radius = (src_type == UNIT_STAR) ? 7.0f : 4.0f;
+    p->life_timer = 0.0f;
+    p->max_life = 3.5f;
+    p->splash_radius = splash;
+    p->is_active = true;
+
+    emit_sim_event(1, src_id, 0, x, y, dmg);
+}
+
+void update_unit(Unit* unit, Army* enemy_army, float dt) {
+    if (!unit->is_alive) return;
+
+    /* TABS Wobble & Timers */
+    unit->wobble_phase += unit->wobble_freq * dt;
+    if (unit->attack_timer > 0.0f) unit->attack_timer -= dt;
+    if (unit->hit_flash_timer > 0.0f) unit->hit_flash_timer -= dt;
+
+    /* Hexagon Support Warden: Passive Sanctuary Healing Pulse */
+    if (unit->type == UNIT_HEXAGON && unit->attack_timer <= 0.0f) {
+        unit->attack_timer = unit->attack_cooldown;
+        Army* my_army = (unit->team == TEAM_PLAYER) ? &g_player_army : &g_enemy_army;
+        for (int i = 0; i < my_army->count; i++) {
+            Unit* ally = &my_army->units[i];
+            if (ally->is_alive) {
+                float d = get_distance(unit->x, unit->y, ally->x, ally->y);
+                if (d <= unit->range) {
+                    ally->health += 20.0f;
+                    if (ally->health > ally->max_health) ally->health = ally->max_health;
+                    ally->hit_flash_timer = 0.08f;
+                }
+            }
+        }
+        emit_sim_event(3, unit->id, 0, unit->x, unit->y, 20.0f);
+    }
+
+    Unit* target = find_nearest_enemy(unit, enemy_army);
+    if (!target) return;
+
+    unit->target_id = target->id;
+    float dist = get_distance(unit->x, unit->y, target->x, target->y);
+    float dx = target->x - unit->x;
+    float dy = target->y - unit->y;
+    float len = sqrtf(dx * dx + dy * dy);
+
+    if (len > 0.0001f) {
+        unit->target_angle = atan2f(dy, dx);
+        float diff = unit->target_angle - unit->angle;
+        while (diff > M_PI) diff -= 2.0f * M_PI;
+        while (diff < -M_PI) diff += 2.0f * M_PI;
+        unit->angle += diff * fminf(dt * 8.0f, 1.0f);
+    }
+
+    if (dist <= unit->range) {
+        /* Attack Logic */
+        if (unit->attack_timer <= 0.0f) {
+            unit->attack_timer = unit->attack_cooldown;
+
+            if (unit->type == UNIT_TRIANGLE) {
+                /* Archer Ballistic Arrow */
+                spawn_projectile(unit->id, unit->team, unit->type, unit->x, unit->y, target->x, target->y, unit->damage, 320.0f, 0.0f);
+            } else if (unit->type == UNIT_STAR) {
+                /* Nova Sorcerer Explosive Sphere */
+                spawn_projectile(unit->id, unit->team, unit->type, unit->x, unit->y, target->x, target->y, unit->damage, 250.0f, 55.0f);
+            } else if (unit->type != UNIT_HEXAGON) {
+                /* Melee Strike with Lunge & Knockback */
+                float nx = (len > 0.0001f) ? (dx / len) : 1.0f;
+                float ny = (len > 0.0001f) ? (dy / len) : 0.0f;
+
+                unit->vx += nx * 80.0f;
+                unit->vy += ny * 80.0f;
+
+                target->health -= unit->damage;
+                target->hit_flash_timer = 0.12f;
+                target->wobble_phase += 1.8f;
+
+                /* Knockback based on mass */
+                float impulse = (unit->type == UNIT_PENTAGON) ? 140.0f : 80.0f;
+                if (target->mass > 0.1f) {
+                    target->vx += (nx * impulse) / target->mass;
+                    target->vy += (ny * impulse) / target->mass;
+                }
+
+                emit_sim_event(0, unit->id, target->id, target->x, target->y, unit->damage);
+
+                if (target->health <= 0.0f) {
+                    target->health = 0.0f;
+                    target->is_alive = false;
+                    unit->kills++;
+                    emit_sim_event(2, unit->id, target->id, target->x, target->y, 0.0f);
+                }
+            }
+        }
+        /* Slow down during active combat engagement */
+        unit->force_x = 0.0f;
+        unit->force_y = 0.0f;
+    } else {
+        /* March toward target */
+        if (len > 0.0001f) {
+            unit->force_x = (dx / len) * unit->speed * 8.0f;
+            unit->force_y = (dy / len) * unit->speed * 8.0f;
+        }
+    }
+}
+
+bool has_army_lost(Army* army) {
+    for (int i = 0; i < army->count; i++) {
+        if (army->units[i].is_alive) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Elastic Mass-Weighted Separation Solver */
+static void resolve_all_collisions(Army* a1, Army* a2) {
+    Army* armies[2] = { a1, a2 };
+    for (int a = 0; a < 2; a++) {
+        Army* armA = armies[a];
+        for (int i = 0; i < armA->count; i++) {
+            Unit* u = &armA->units[i];
+            if (!u->is_alive) continue;
+
+            for (int b = a; b < 2; b++) {
+                Army* armB = armies[b];
+                int start_j = (a == b) ? (i + 1) : 0;
+                for (int j = start_j; j < armB->count; j++) {
+                    Unit* o = &armB->units[j];
+                    if (!o->is_alive) continue;
+
+                    float min_dist = u->radius + o->radius;
+                    float dx = u->x - o->x;
+                    float dy = u->y - o->y;
+                    float d2 = dx * dx + dy * dy;
+
+                    if (d2 < min_dist * min_dist && d2 > 0.0001f) {
+                        float d = sqrtf(d2);
+                        float overlap = 0.5f * (min_dist - d);
+                        float nx = dx / d;
+                        float ny = dy / d;
+
+                        float total_mass = u->mass + o->mass;
+                        float r_u = o->mass / total_mass;
+                        float r_o = u->mass / total_mass;
+
+                        u->x += nx * overlap * r_u;
+                        u->y += ny * overlap * r_u;
+                        o->x -= nx * overlap * r_o;
+                        o->y -= ny * overlap * r_o;
+
+                        float rvx = u->vx - o->vx;
+                        float rvy = u->vy - o->vy;
+                        float vel_norm = rvx * nx + rvy * ny;
+                        if (vel_norm < 0.0f) {
+                            float impulse = -(1.2f) * vel_norm / (1.0f / u->mass + 1.0f / o->mass);
+                            u->vx += (impulse / u->mass) * nx;
+                            u->vy += (impulse / u->mass) * ny;
+                            o->vx -= (impulse / o->mass) * nx;
+                            o->vy -= (impulse / o->mass) * ny;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/* Physics Integration & Arena Boundary Clamping */
+static void integrate_army_physics(Army* army, float dt, float arena_w, float arena_h) {
+    for (int i = 0; i < army->count; i++) {
+        Unit* u = &army->units[i];
+        if (!u->is_alive) continue;
+
+        float ax = u->force_x / u->mass;
+        float ay = u->force_y / u->mass;
+        u->vx += ax * dt;
+        u->vy += ay * dt;
+
+        float drag = powf(0.82f, dt * 60.0f);
+        u->vx *= drag;
+        u->vy *= drag;
+
+        u->x += u->vx * dt;
+        u->y += u->vy * dt;
+
+        /* Arena Boundary Constraints */
+        float min_x = u->radius;
+        float max_x = arena_w - u->radius;
+        float min_y = u->radius;
+        float max_y = arena_h - u->radius;
+
+        if (u->x < min_x) { u->x = min_x; u->vx *= -0.5f; }
+        else if (u->x > max_x) { u->x = max_x; u->vx *= -0.5f; }
+
+        if (u->y < min_y) { u->y = min_y; u->vy *= -0.5f; }
+        else if (u->y > max_y) { u->y = max_y; u->vy *= -0.5f; }
+    }
+}
+
+/* Update Ballistic Projectiles */
+static void update_projectiles(float dt) {
+    for (int i = g_projectile_count - 1; i >= 0; i--) {
+        Projectile* p = &g_projectiles[i];
+        if (!p->is_active) {
+            g_projectiles[i] = g_projectiles[--g_projectile_count];
+            continue;
+        }
+
+        p->life_timer += dt;
+        if (p->life_timer >= p->max_life) {
+            p->is_active = false;
+            g_projectiles[i] = g_projectiles[--g_projectile_count];
+            continue;
+        }
+
+        p->x += p->vx * dt;
+        p->y += p->vy * dt;
+
+        Army* target_army = (p->team == TEAM_PLAYER) ? &g_enemy_army : &g_player_army;
+        bool hit = false;
+
+        for (int j = 0; j < target_army->count; j++) {
+            Unit* victim = &target_army->units[j];
+            if (!victim->is_alive) continue;
+
+            float hit_dist = p->radius + victim->radius;
+            float d = get_distance(p->x, p->y, victim->x, victim->y);
+            if (d <= hit_dist) {
+                hit = true;
+                if (p->splash_radius > 0.0f) {
+                    /* Splash Damage for Nova Sorcerer */
+                    for (int k = 0; k < target_army->count; k++) {
+                        Unit* s = &target_army->units[k];
+                        if (s->is_alive) {
+                            float sd = get_distance(p->x, p->y, s->x, s->y);
+                            if (sd <= p->splash_radius) {
+                                float falloff = 1.0f - (sd / p->splash_radius) * 0.5f;
+                                s->health -= p->damage * falloff;
+                                s->hit_flash_timer = 0.12f;
+                                emit_sim_event(0, 0, s->id, s->x, s->y, p->damage * falloff);
+                                if (s->health <= 0.0f) {
+                                    s->health = 0.0f;
+                                    s->is_alive = false;
+                                    emit_sim_event(2, 0, s->id, s->x, s->y, 0.0f);
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    victim->health -= p->damage;
+                    victim->hit_flash_timer = 0.12f;
+                    emit_sim_event(0, 0, victim->id, victim->x, victim->y, p->damage);
+                    if (victim->health <= 0.0f) {
+                        victim->health = 0.0f;
+                        victim->is_alive = false;
+                        emit_sim_event(2, 0, victim->id, victim->x, victim->y, 0.0f);
+                    }
+                }
+                break;
+            }
+        }
+
+        if (hit) {
+            p->is_active = false;
+            g_projectiles[i] = g_projectiles[--g_projectile_count];
+        }
+    }
+}
+
+/* Foundational Battle Step Simulation Function */
+int simulate_battle_step(Army* player_army, Army* enemy_army, float dt) {
+    /* 1. Update Unit Decisions & Attacks */
+    for (int i = 0; i < player_army->count; i++) {
+        update_unit(&player_army->units[i], enemy_army, dt);
+    }
+    for (int i = 0; i < enemy_army->count; i++) {
+        update_unit(&enemy_army->units[i], player_army, dt);
+    }
+
+    /* 2. Soft-Body Separation & Collision Physics */
+    resolve_all_collisions(player_army, enemy_army);
+    integrate_army_physics(player_army, dt, g_state.arena_width, g_state.arena_height);
+    integrate_army_physics(enemy_army, dt, g_state.arena_width, g_state.arena_height);
+
+    /* 3. Ballistic Projectiles */
+    update_projectiles(dt);
+
+    /* 4. Determine Outcome */
+    bool player_lost = has_army_lost(player_army);
+    bool enemy_lost = has_army_lost(enemy_army);
+
+    if (player_lost && enemy_lost) return 3; // Mutual Annihilation / Draw
+    if (player_lost) return 2;               // Enemy wins
+    if (enemy_lost)  return 1;               // Player wins
+
+    return 0; // Ongoing
+}
+
+/* --------------------------------------------------------------------------
+ * 2. C Engine Lifecycle & Archetype Initializers
+ * -------------------------------------------------------------------------- */
+
+static void init_archetype(Unit* u, UnitType type, Team team, float x, float y, float angle) {
+    u->id = g_next_id++;
+    u->team = team;
+    u->type = type;
+    u->x = x;
+    u->y = y;
+    u->vx = 0.0f;
+    u->vy = 0.0f;
+    u->force_x = 0.0f;
+    u->force_y = 0.0f;
     u->angle = angle;
     u->target_angle = angle;
+    u->is_alive = true;
     u->target_id = -1;
     u->attack_timer = 0.0f;
-    u->windup_timer = 0.0f;
+    u->hit_flash_timer = 0.0f;
     u->wobble_phase = ((float)rand() / (float)RAND_MAX) * 6.28f;
     u->wobble_freq = 8.0f + ((float)rand() / (float)RAND_MAX) * 4.0f;
-    u->hit_flash_timer = 0.0f;
-    u->knockback_decay = 0.88f;
     u->kills = 0;
 
     switch (type) {
-        case UNIT_SQUARE: /* Basic Melee Infantry */
-            u->max_hp = 120.0f;
-            u->hp = 120.0f;
+        case UNIT_SQUARE: // Melee Foot Soldier
+            u->max_health = 120.0f;
+            u->health = 120.0f;
+            u->damage = 22.0f;
+            u->range = 28.0f;
             u->speed = 85.0f;
-            u->attack_range = 28.0f;
-            u->attack_damage = 22.0f;
             u->attack_cooldown = 1.0f;
             u->radius = 16.0f;
             u->mass = 1.6f;
             break;
 
-        case UNIT_TRIANGLE: /* Archer / Ranged */
-            u->max_hp = 60.0f;
-            u->hp = 60.0f;
+        case UNIT_TRIANGLE: // Ranged Archer
+            u->max_health = 60.0f;
+            u->health = 60.0f;
+            u->damage = 26.0f;
+            u->range = 260.0f;
             u->speed = 70.0f;
-            u->attack_range = 260.0f;
-            u->attack_damage = 26.0f;
             u->attack_cooldown = 1.6f;
             u->radius = 14.0f;
             u->mass = 0.9f;
             break;
 
-        case UNIT_CIRCLE: /* Cavalry / Flanker */
-            u->max_hp = 95.0f;
-            u->hp = 95.0f;
+        case UNIT_CIRCLE: // Cavalry Flanker
+            u->max_health = 95.0f;
+            u->health = 95.0f;
+            u->damage = 36.0f;
+            u->range = 30.0f;
             u->speed = 175.0f;
-            u->attack_range = 30.0f;
-            u->attack_damage = 36.0f;
             u->attack_cooldown = 1.1f;
             u->radius = 15.0f;
             u->mass = 2.0f;
             break;
 
-        case UNIT_PENTAGON: /* Heavy Tank */
-            u->max_hp = 280.0f;
-            u->hp = 280.0f;
+        case UNIT_PENTAGON: // Heavy Tank
+            u->max_health = 280.0f;
+            u->health = 280.0f;
+            u->damage = 44.0f;
+            u->range = 34.0f;
             u->speed = 52.0f;
-            u->attack_range = 34.0f;
-            u->attack_damage = 44.0f;
             u->attack_cooldown = 1.6f;
             u->radius = 23.0f;
             u->mass = 4.2f;
             break;
 
-        case UNIT_HEXAGON: /* Support Warden */
-            u->max_hp = 140.0f;
-            u->hp = 140.0f;
+        case UNIT_HEXAGON: // Support Warden
+            u->max_health = 140.0f;
+            u->health = 140.0f;
+            u->damage = 12.0f;
+            u->range = 150.0f;
             u->speed = 65.0f;
-            u->attack_range = 150.0f;
-            u->attack_damage = 12.0f;
             u->attack_cooldown = 2.2f;
             u->radius = 18.0f;
             u->mass = 2.2f;
             break;
 
-        case UNIT_STAR: /* Nova Sorcerer */
-            u->max_hp = 75.0f;
-            u->hp = 75.0f;
+        case UNIT_STAR: // Nova Sorcerer
+            u->max_health = 75.0f;
+            u->health = 75.0f;
+            u->damage = 48.0f;
+            u->range = 230.0f;
             u->speed = 60.0f;
-            u->attack_range = 230.0f;
-            u->attack_damage = 48.0f;
             u->attack_cooldown = 2.4f;
             u->radius = 16.0f;
             u->mass = 1.1f;
@@ -154,478 +483,104 @@ static void init_unit_stats(Unit* u, UnitType type, Team team, float x, float y,
     }
 }
 
-/* Public Engine Management */
 void engine_init(float width, float height) {
-    memset(g_units, 0, sizeof(g_units));
-    memset(g_projectiles, 0, sizeof(g_projectiles));
-    memset(g_events, 0, sizeof(g_events));
-    memset(&g_state, 0, sizeof(g_state));
-
-    g_state.arena_width = (width > 200.0f) ? width : ARENA_DEFAULT_WIDTH;
-    g_state.arena_height = (height > 200.0f) ? height : ARENA_DEFAULT_HEIGHT;
-    g_state.phase = SIM_PHASE_DEPLOYMENT;
-    g_next_unit_id = 1;
-    g_next_proj_id = 1;
+    memset(&g_player_army, 0, sizeof(Army));
+    memset(&g_enemy_army, 0, sizeof(Army));
+    memset(&g_state, 0, sizeof(BattleState));
+    g_projectile_count = 0;
     g_event_count = 0;
+    g_next_id = 1;
+
+    g_state.arena_width = (width > 200.0f) ? width : ARENA_WIDTH;
+    g_state.arena_height = (height > 200.0f) ? height : ARENA_HEIGHT;
+    g_state.phase = 4; // Deployment
 }
 
 void engine_reset(void) {
-    for (uint32_t i = 0; i < MAX_UNITS; i++) {
-        g_units[i].is_active = 0;
-    }
-    for (uint32_t i = 0; i < MAX_PROJECTILES; i++) {
-        g_projectiles[i].is_active = 0;
-    }
-    g_state.unit_count = 0;
-    g_state.projectile_count = 0;
-    g_state.sim_time = 0.0f;
-    g_state.phase = SIM_PHASE_DEPLOYMENT;
-    g_state.blue_alive = 0;
-    g_state.red_alive = 0;
-    g_state.blue_total_hp = 0.0f;
-    g_state.red_total_hp = 0.0f;
-    g_state.blue_initial_count = 0;
-    g_state.red_initial_count = 0;
+    g_player_army.count = 0;
+    g_enemy_army.count = 0;
+    g_projectile_count = 0;
     g_event_count = 0;
+    g_state.sim_time = 0.0f;
+    g_state.phase = 4;
 }
 
-int32_t engine_add_unit(uint8_t type, uint8_t team, float x, float y, float angle) {
-    if (g_state.unit_count >= MAX_UNITS) return -1;
+int engine_add_unit(int type, int team, float x, float y, float angle) {
+    Army* army = (team == TEAM_PLAYER) ? &g_player_army : &g_enemy_army;
+    if (army->count >= MAX_UNITS) return -1;
 
-    for (uint32_t i = 0; i < MAX_UNITS; i++) {
-        if (!g_units[i].is_active) {
-            init_unit_stats(&g_units[i], (UnitType)type, (Team)team, x, y, angle);
-            g_state.unit_count++;
-            if (team == TEAM_BLUE) {
-                g_state.blue_alive++;
-                g_state.blue_initial_count++;
-                g_state.blue_total_hp += g_units[i].hp;
-            } else {
-                g_state.red_alive++;
-                g_state.red_initial_count++;
-                g_state.red_total_hp += g_units[i].hp;
-            }
-            return (int32_t)g_units[i].id;
-        }
-    }
-    return -1;
+    Unit* u = &army->units[army->count++];
+    init_archetype(u, (UnitType)type, (Team)team, x, y, angle);
+    return u->id;
 }
 
-bool engine_remove_unit(uint32_t id) {
-    for (uint32_t i = 0; i < MAX_UNITS; i++) {
-        if (g_units[i].is_active && g_units[i].id == id) {
-            if (g_units[i].team == TEAM_BLUE) {
-                if (g_state.blue_alive > 0) g_state.blue_alive--;
-                if (g_state.blue_initial_count > 0) g_state.blue_initial_count--;
-                g_state.blue_total_hp -= g_units[i].hp;
-            } else {
-                if (g_state.red_alive > 0) g_state.red_alive--;
-                if (g_state.red_initial_count > 0) g_state.red_initial_count--;
-                g_state.red_total_hp -= g_units[i].hp;
+bool engine_remove_unit(int id) {
+    Army* armies[2] = { &g_player_army, &g_enemy_army };
+    for (int a = 0; a < 2; a++) {
+        Army* arm = armies[a];
+        for (int i = 0; i < arm->count; i++) {
+            if (arm->units[i].id == id) {
+                for (int k = i; k < arm->count - 1; k++) {
+                    arm->units[k] = arm->units[k + 1];
+                }
+                arm->count--;
+                return true;
             }
-            g_units[i].is_active = 0;
-            if (g_state.unit_count > 0) g_state.unit_count--;
-            return true;
         }
     }
     return false;
 }
 
 void engine_start_battle(void) {
-    g_state.phase = SIM_PHASE_BATTLE;
+    g_state.phase = 0; // Ongoing battle
     g_state.sim_time = 0.0f;
     g_event_count = 0;
 }
 
-void engine_pause_battle(void) {
-    /* Handled by host or pause loop */
-}
-
-void engine_resume_battle(void) {
-    if (g_state.phase == SIM_PHASE_DEPLOYMENT) {
-        g_state.phase = SIM_PHASE_BATTLE;
-    }
-}
-
-/* Projectile Spawning */
-static void spawn_projectile(uint32_t src_id, uint8_t team, uint8_t src_type, Vec2 pos, Vec2 target_pos, float damage, float speed, float splash) {
-    for (uint32_t i = 0; i < MAX_PROJECTILES; i++) {
-        if (!g_projectiles[i].is_active) {
-            Projectile* p = &g_projectiles[i];
-            p->id = g_next_proj_id++;
-            p->team = team;
-            p->source_type = src_type;
-            p->is_active = 1;
-            p->pos = pos;
-
-            Vec2 dir = { target_pos.x - pos.x, target_pos.y - pos.y };
-            dir = vec2_norm(dir);
-            p->vel.x = dir.x * speed;
-            p->vel.y = dir.y * speed;
-
-            p->damage = damage;
-            p->radius = (src_type == UNIT_STAR) ? 7.0f : 4.0f;
-            p->life_timer = 0.0f;
-            p->max_life = 3.5f;
-            p->splash_radius = splash;
-            g_state.projectile_count++;
-
-            emit_event(EVENT_PROJECTILE_FIRE, src_id, 0, pos.x, pos.y, damage);
-            return;
-        }
-    }
-}
-
-/* AI Target Selection (Behavior Tree Node) */
-static Unit* select_target(Unit* u) {
-    Unit* best_target = NULL;
-    float best_dist_sq = 1e9f;
-
-    for (uint32_t i = 0; i < MAX_UNITS; i++) {
-        Unit* other = &g_units[i];
-        if (!other->is_active || other->hp <= 0.0f || other->team == u->team) {
-            continue;
-        }
-
-        float dist_sq = vec2_dist_sq(u->pos, other->pos);
-
-        /* Cavalry (Circle) prefers ranged archers and sorcerers (flanking behavior) */
-        if (u->type == UNIT_CIRCLE) {
-            if (other->type == UNIT_TRIANGLE || other->type == UNIT_STAR) {
-                dist_sq *= 0.45f; /* Higher priority */
-            }
-        }
-
-        if (dist_sq < best_dist_sq) {
-            best_dist_sq = dist_sq;
-            best_target = other;
-        }
-    }
-
-    return best_target;
-}
-
-/* Damage and Knockback Application */
-static void apply_damage(Unit* victim, Unit* attacker, float amount, Vec2 impulse_dir, float impulse_force) {
-    victim->hp -= amount;
-    victim->hit_flash_timer = 0.12f;
-    victim->wobble_phase += 1.8f; /* Sudden jerk / ragdoll wobble on hit */
-
-    /* Apply knockback impulse inversely proportional to mass */
-    if (victim->mass > 0.1f) {
-        float factor = impulse_force / victim->mass;
-        victim->vel.x += impulse_dir.x * factor;
-        victim->vel.y += impulse_dir.y * factor;
-    }
-
-    emit_event(EVENT_ATTACK_HIT, attacker ? attacker->id : 0, victim->id, victim->pos.x, victim->pos.y, amount);
-
-    if (victim->hp <= 0.0f) {
-        victim->hp = 0.0f;
-        victim->state = STATE_DEAD;
-        victim->is_active = 0;
-        if (attacker) attacker->kills++;
-
-        if (victim->team == TEAM_BLUE) {
-            if (g_state.blue_alive > 0) g_state.blue_alive--;
-        } else {
-            if (g_state.red_alive > 0) g_state.red_alive--;
-        }
-
-        emit_event(EVENT_UNIT_KILLED, attacker ? attacker->id : 0, victim->id, victim->pos.x, victim->pos.y, 0.0f);
-    }
-}
-
-/* Single Frame Simulation Step */
 void engine_step(float dt) {
-    if (g_state.phase != SIM_PHASE_BATTLE) {
-        return;
-    }
+    if (g_state.phase != 0) return;
 
-    /* Clamp dt for deterministic stability */
-    dt = clampf(dt, 0.001f, 0.05f);
+    if (dt > 0.05f) dt = 0.05f;
+    if (dt < 0.001f) dt = 0.001f;
     g_state.sim_time += dt;
 
-    /* 1. Unit AI & Behavior Tree Evaluation */
-    for (uint32_t i = 0; i < MAX_UNITS; i++) {
-        Unit* u = &g_units[i];
-        if (!u->is_active || u->hp <= 0.0f) continue;
+    int result = simulate_battle_step(&g_player_army, &g_enemy_army, dt);
+    if (g_state.sim_time > 0.2f && result != 0) {
+        g_state.phase = result;
+    }
 
-        /* Wobble oscillation */
-        u->wobble_phase += u->wobble_freq * dt;
+    /* Compute Totals */
+    int p_alive = 0, e_alive = 0;
+    float p_hp = 0.0f, e_hp = 0.0f;
 
-        /* Cooldown timers */
-        if (u->attack_timer > 0.0f) u->attack_timer -= dt;
-        if (u->hit_flash_timer > 0.0f) u->hit_flash_timer -= dt;
-
-        /* Warden (Hexagon) Special Aura: Passive Healing Pulse */
-        if (u->type == UNIT_HEXAGON) {
-            if (u->attack_timer <= 0.0f) {
-                u->attack_timer = u->attack_cooldown;
-                /* Heal nearby allies within 140 range */
-                for (uint32_t j = 0; j < MAX_UNITS; j++) {
-                    Unit* ally = &g_units[j];
-                    if (ally->is_active && ally->hp > 0.0f && ally->team == u->team) {
-                        float d = vec2_dist(u->pos, ally->pos);
-                        if (d <= u->attack_range) {
-                            ally->hp = clampf(ally->hp + 20.0f, 0.0f, ally->max_hp);
-                            ally->hit_flash_timer = 0.08f;
-                        }
-                    }
-                }
-                emit_event(EVENT_SPECIAL_AURA, u->id, 0, u->pos.x, u->pos.y, 20.0f);
-            }
+    for (int i = 0; i < g_player_army.count; i++) {
+        if (g_player_army.units[i].is_alive) {
+            p_alive++;
+            p_hp += g_player_army.units[i].health;
         }
-
-        /* Target Selection */
-        Unit* target = select_target(u);
-        if (target) {
-            u->target_id = (int32_t)target->id;
-            float dist = vec2_dist(u->pos, target->pos);
-            Vec2 to_target = { target->pos.x - u->pos.x, target->pos.y - u->pos.y };
-            Vec2 dir = vec2_norm(to_target);
-            u->target_angle = atan2f(dir.y, dir.x);
-
-            /* Smooth rotation towards target */
-            float angle_diff = u->target_angle - u->angle;
-            while (angle_diff > M_PI) angle_diff -= 2.0f * (float)M_PI;
-            while (angle_diff < -M_PI) angle_diff += 2.0f * (float)M_PI;
-            u->angle += angle_diff * clampf(dt * 8.0f, 0.0f, 1.0f);
-
-            /* In attack range check */
-            if (dist <= u->attack_range) {
-                /* Attack State Machine */
-                if (u->attack_timer <= 0.0f) {
-                    if (u->type == UNIT_TRIANGLE) {
-                        /* Fire Arrow */
-                        u->attack_timer = u->attack_cooldown;
-                        Vec2 spawn_pos = { u->pos.x + dir.x * u->radius, u->pos.y + dir.y * u->radius };
-                        spawn_projectile(u->id, u->team, u->type, spawn_pos, target->pos, u->attack_damage, 320.0f, 0.0f);
-                    } else if (u->type == UNIT_STAR) {
-                        /* Fire Explosive Nova */
-                        u->attack_timer = u->attack_cooldown;
-                        Vec2 spawn_pos = { u->pos.x + dir.x * u->radius, u->pos.y + dir.y * u->radius };
-                        spawn_projectile(u->id, u->team, u->type, spawn_pos, target->pos, u->attack_damage, 250.0f, 55.0f);
-                    } else if (u->type != UNIT_HEXAGON) {
-                        /* Melee Strike with Lunge */
-                        u->attack_timer = u->attack_cooldown;
-                        u->vel.x += dir.x * 90.0f;
-                        u->vel.y += dir.y * 90.0f;
-                        apply_damage(target, u, u->attack_damage, dir, (u->type == UNIT_PENTAGON) ? 140.0f : 80.0f);
-                    }
-                }
-                /* Slow down when fighting */
-                u->force.x = 0.0f;
-                u->force.y = 0.0f;
-            } else {
-                /* March / Pursue */
-                u->state = STATE_PURSUING;
-                u->force.x = dir.x * u->speed * 8.0f;
-                u->force.y = dir.y * u->speed * 8.0f;
-            }
-        } else {
-            u->target_id = -1;
-            u->state = STATE_IDLE;
-            u->force.x = 0.0f;
-            u->force.y = 0.0f;
-        }
-
-        /* 2. Soft-Body Separation & Cohesion Steering */
-        for (uint32_t j = i + 1; j < MAX_UNITS; j++) {
-            Unit* b = &g_units[j];
-            if (!b->is_active || b->hp <= 0.0f) continue;
-
-            float min_dist = u->radius + b->radius;
-            float d2 = vec2_dist_sq(u->pos, b->pos);
-            if (d2 < min_dist * min_dist && d2 > 0.0001f) {
-                float d = sqrtf(d2);
-                float overlap = 0.5f * (min_dist - d);
-                float nx = (u->pos.x - b->pos.x) / d;
-                float ny = (u->pos.y - b->pos.y) / d;
-
-                /* Push apart based on relative masses */
-                float total_mass = u->mass + b->mass;
-                float r_a = b->mass / total_mass;
-                float r_b = u->mass / total_mass;
-
-                u->pos.x += nx * overlap * r_a;
-                u->pos.y += ny * overlap * r_a;
-                b->pos.x -= nx * overlap * r_b;
-                b->pos.y -= ny * overlap * r_b;
-
-                /* Elastic velocity impulse */
-                float rvx = u->vel.x - b->vel.x;
-                float rvy = u->vel.y - b->vel.y;
-                float vel_along_norm = rvx * nx + rvy * ny;
-                if (vel_along_norm < 0.0f) {
-                    float impulse = -(1.2f) * vel_along_norm / (1.0f / u->mass + 1.0f / b->mass);
-                    u->vel.x += (impulse / u->mass) * nx;
-                    u->vel.y += (impulse / u->mass) * ny;
-                    b->vel.x -= (impulse / b->mass) * nx;
-                    b->vel.y -= (impulse / b->mass) * ny;
-                }
-            }
+    }
+    for (int i = 0; i < g_enemy_army.count; i++) {
+        if (g_enemy_army.units[i].is_alive) {
+            e_alive++;
+            e_hp += g_enemy_army.units[i].health;
         }
     }
 
-    /* 3. Integrate Physics & Arena Boundaries */
-    for (uint32_t i = 0; i < MAX_UNITS; i++) {
-        Unit* u = &g_units[i];
-        if (!u->is_active || u->hp <= 0.0f) continue;
-
-        /* Acceleration = Force / Mass */
-        float ax = u->force.x / u->mass;
-        float ay = u->force.y / u->mass;
-
-        u->vel.x += ax * dt;
-        u->vel.y += ay * dt;
-
-        /* Friction & drag */
-        u->vel.x *= powf(0.82f, dt * 60.0f);
-        u->vel.y *= powf(0.82f, dt * 60.0f);
-
-        u->pos.x += u->vel.x * dt;
-        u->pos.y += u->vel.y * dt;
-
-        /* Arena Boundary Constraints with Bounce */
-        float min_x = u->radius;
-        float max_x = g_state.arena_width - u->radius;
-        float min_y = u->radius;
-        float max_y = g_state.arena_height - u->radius;
-
-        if (u->pos.x < min_x) {
-            u->pos.x = min_x;
-            u->vel.x *= -0.5f;
-        } else if (u->pos.x > max_x) {
-            u->pos.x = max_x;
-            u->vel.x *= -0.5f;
-        }
-
-        if (u->pos.y < min_y) {
-            u->pos.y = min_y;
-            u->vel.y *= -0.5f;
-        } else if (u->pos.y > max_y) {
-            u->pos.y = max_y;
-            u->vel.y *= -0.5f;
-        }
-    }
-
-    /* 4. Projectile Integration and Collision */
-    for (uint32_t i = 0; i < MAX_PROJECTILES; i++) {
-        Projectile* p = &g_projectiles[i];
-        if (!p->is_active) continue;
-
-        p->life_timer += dt;
-        if (p->life_timer >= p->max_life) {
-            p->is_active = 0;
-            if (g_state.projectile_count > 0) g_state.projectile_count--;
-            continue;
-        }
-
-        p->pos.x += p->vel.x * dt;
-        p->pos.y += p->vel.y * dt;
-
-        /* Arena bounds check */
-        if (p->pos.x < 0.0f || p->pos.x > g_state.arena_width ||
-            p->pos.y < 0.0f || p->pos.y > g_state.arena_height) {
-            p->is_active = 0;
-            if (g_state.projectile_count > 0) g_state.projectile_count--;
-            continue;
-        }
-
-        /* Check collision with enemy units */
-        for (uint32_t j = 0; j < MAX_UNITS; j++) {
-            Unit* victim = &g_units[j];
-            if (!victim->is_active || victim->hp <= 0.0f || victim->team == p->team) {
-                continue;
-            }
-
-            float hit_dist = p->radius + victim->radius;
-            if (vec2_dist_sq(p->pos, victim->pos) <= hit_dist * hit_dist) {
-                /* Hit detected! */
-                Vec2 norm_vel = vec2_norm(p->vel);
-
-                if (p->splash_radius > 0.0f) {
-                    /* Splash Damage for Nova Sorcerer (Star) */
-                    for (uint32_t k = 0; k < MAX_UNITS; k++) {
-                        Unit* splash_target = &g_units[k];
-                        if (splash_target->is_active && splash_target->hp > 0.0f && splash_target->team != p->team) {
-                            float d = vec2_dist(p->pos, splash_target->pos);
-                            if (d <= p->splash_radius) {
-                                float falloff = 1.0f - (d / p->splash_radius) * 0.5f;
-                                Vec2 spl_dir = { splash_target->pos.x - p->pos.x, splash_target->pos.y - p->pos.y };
-                                spl_dir = vec2_norm(spl_dir);
-                                apply_damage(splash_target, NULL, p->damage * falloff, spl_dir, 120.0f);
-                            }
-                        }
-                    }
-                } else {
-                    /* Direct projectile hit */
-                    apply_damage(victim, NULL, p->damage, norm_vel, 70.0f);
-                }
-
-                p->is_active = 0;
-                if (g_state.projectile_count > 0) g_state.projectile_count--;
-                break;
-            }
-        }
-    }
-
-    /* 5. Update Total Armies HP and Check Win/Loss Condition */
-    float blue_hp = 0.0f;
-    float red_hp = 0.0f;
-    uint32_t blue_count = 0;
-    uint32_t red_count = 0;
-
-    for (uint32_t i = 0; i < MAX_UNITS; i++) {
-        if (g_units[i].is_active && g_units[i].hp > 0.0f) {
-            if (g_units[i].team == TEAM_BLUE) {
-                blue_hp += g_units[i].hp;
-                blue_count++;
-            } else {
-                red_hp += g_units[i].hp;
-                red_count++;
-            }
-        }
-    }
-
-    g_state.blue_alive = blue_count;
-    g_state.red_alive = red_count;
-    g_state.blue_total_hp = blue_hp;
-    g_state.red_total_hp = red_hp;
-
-    /* Win/Loss Check (after initial battle start beat of 0.2s) */
-    if (g_state.sim_time > 0.2f) {
-        if (blue_count == 0 && red_count == 0) {
-            g_state.phase = SIM_PHASE_DRAW;
-        } else if (blue_count == 0) {
-            g_state.phase = SIM_PHASE_VICTORY_RED;
-        } else if (red_count == 0) {
-            g_state.phase = SIM_PHASE_VICTORY_BLUE;
-        }
-    }
+    g_state.player_alive = p_alive;
+    g_state.enemy_alive = e_alive;
+    g_state.player_total_hp = p_hp;
+    g_state.enemy_total_hp = e_hp;
 }
 
-/* Public Pointers for Zero-Copy WASM Heap Inspection */
-const BattleState* engine_get_state(void) {
-    return &g_state;
-}
-
-const Unit* engine_get_units(uint32_t* out_count) {
-    if (out_count) *out_count = g_state.unit_count;
-    return g_units;
-}
-
-const Projectile* engine_get_projectiles(uint32_t* out_count) {
-    if (out_count) *out_count = g_state.projectile_count;
+const Army* engine_get_player_army(void) { return &g_player_army; }
+const Army* engine_get_enemy_army(void) { return &g_enemy_army; }
+const BattleState* engine_get_state(void) { return &g_state; }
+const Projectile* engine_get_projectiles(int* out_count) {
+    if (out_count) *out_count = g_projectile_count;
     return g_projectiles;
 }
-
-const SimEvent* engine_get_events(uint32_t* out_count) {
+const SimEvent* engine_get_events(int* out_count) {
     if (out_count) *out_count = g_event_count;
     return g_events;
 }
-
-void engine_clear_events(void) {
-    g_event_count = 0;
-}
+void engine_clear_events(void) { g_event_count = 0; }

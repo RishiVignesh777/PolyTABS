@@ -9,6 +9,7 @@
 
 import {
   Unit,
+  Army,
   Projectile,
   BattleState,
   UnitType,
@@ -175,6 +176,60 @@ export class CSimulationEngine {
 
   public getUnits(): Unit[] {
     return this.units;
+  }
+
+  // --- Foundational Reference Methods (Matching C Reference Implementation) ---
+  public getDistance(x1: number, y1: number, x2: number, y2: number): number {
+    const dx = x2 - x1;
+    const dy = y2 - y1;
+    return Math.sqrt(dx * dx + dy * dy);
+  }
+
+  public findNearestEnemy(currentUnit: Unit, enemyArmy: Unit[]): Unit | null {
+    let nearest: Unit | null = null;
+    let minDist = 99999.0;
+    for (let i = 0; i < enemyArmy.length; i++) {
+      const enemy = enemyArmy[i];
+      if (!enemy.isActive || enemy.hp <= 0) continue;
+      let dist = this.getDistance(currentUnit.pos.x, currentUnit.pos.y, enemy.pos.x, enemy.pos.y);
+      if (currentUnit.type === UnitType.CIRCLE && (enemy.type === UnitType.TRIANGLE || enemy.type === UnitType.STAR)) {
+        dist *= 0.45;
+      }
+      if (dist < minDist) {
+        minDist = dist;
+        nearest = enemy;
+      }
+    }
+    return nearest;
+  }
+
+  public hasArmyLost(armyUnits: Unit[]): boolean {
+    for (let i = 0; i < armyUnits.length; i++) {
+      if (armyUnits[i].isActive && armyUnits[i].hp > 0) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  public simulateBattleStep(playerUnits: Unit[], enemyUnits: Unit[], dt: number): number {
+    this.step(dt);
+    const pLost = this.hasArmyLost(playerUnits);
+    const eLost = this.hasArmyLost(enemyUnits);
+    if (pLost && eLost) return 3; // Draw
+    if (pLost) return 2; // Enemy wins
+    if (eLost) return 1; // Player wins
+    return 0; // Ongoing
+  }
+
+  public getPlayerArmy(): Army {
+    const units = this.units.filter(u => u.team === Team.PLAYER);
+    return { units, count: units.length };
+  }
+
+  public getEnemyArmy(): Army {
+    const units = this.units.filter(u => u.team === Team.ENEMY);
+    return { units, count: units.length };
   }
 
   public getProjectiles(): Projectile[] {

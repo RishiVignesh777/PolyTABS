@@ -13,8 +13,15 @@ export enum UnitType {
 }
 
 export enum Team {
-  BLUE = 0, // Player's Army
-  RED = 1   // Enemy / AI Army
+  PLAYER = 0, // Player's Army (Blue)
+  ENEMY = 1,  // Enemy / AI Army (Red)
+  BLUE = 0,   // Alias
+  RED = 1     // Alias
+}
+
+export interface Army {
+  units: Unit[];
+  count: number;
 }
 
 export enum UnitState {

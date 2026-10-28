@@ -13,6 +13,38 @@ test('CSimulationEngine: initializes with clean state and dimensions', () => {
   assert.equal(engine.state.redAlive, 0);
 });
 
+test('CSimulationEngine: foundational getDistance matches Euclidean distance', () => {
+  const engine = new CSimulationEngine();
+  const d = engine.getDistance(0, 0, 30, 40);
+  assert.equal(d, 50);
+});
+
+test('CSimulationEngine: foundational findNearestEnemy selects closest living target', () => {
+  const engine = new CSimulationEngine();
+  const id1 = engine.addUnit(UnitType.SQUARE, Team.PLAYER, 100, 100);
+  const id2 = engine.addUnit(UnitType.SQUARE, Team.ENEMY, 500, 100); // Far
+  const id3 = engine.addUnit(UnitType.TRIANGLE, Team.ENEMY, 150, 100); // Near
+
+  const player = engine.getUnits().find(u => u.id === id1)!;
+  const enemyArmy = engine.getUnits().filter(u => u.team === Team.ENEMY);
+  const nearest = engine.findNearestEnemy(player, enemyArmy);
+
+  assert.ok(nearest !== null);
+  assert.equal(nearest.id, id3);
+});
+
+test('CSimulationEngine: foundational hasArmyLost detects when all units are dead', () => {
+  const engine = new CSimulationEngine();
+  engine.addUnit(UnitType.SQUARE, Team.PLAYER, 100, 100);
+  const playerArmy = engine.getUnits().filter(u => u.team === Team.PLAYER);
+
+  assert.equal(engine.hasArmyLost(playerArmy), false);
+
+  playerArmy[0].hp = 0;
+  playerArmy[0].isActive = false;
+  assert.equal(engine.hasArmyLost(playerArmy), true);
+});
+
 test('CSimulationEngine: unit archetype configuration matches C specs', () => {
   assert.equal(UNIT_CONFIGS[UnitType.SQUARE].hp, 120);
   assert.equal(UNIT_CONFIGS[UnitType.TRIANGLE].range, 260);
@@ -79,7 +111,6 @@ test('CSimulationEngine: projectile spawns and deals damage to enemy', () => {
   engine.addUnit(UnitType.SQUARE, Team.RED, 200, 200);
 
   engine.startBattle();
-  // Step until arrow is fired and hits
   for (let i = 0; i < 40; i++) {
     engine.step(0.016);
   }

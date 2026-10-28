@@ -15,7 +15,7 @@ export const ArchitectureModal: React.FC<ArchitectureModalProps> = ({
   isOpen,
   onClose
 }) => {
-  const [activeTab, setActiveTab] = useState<'architecture' | 'c_snippets' | 'ts_snippets' | 'c_source'>('architecture');
+  const [activeTab, setActiveTab] = useState<'architecture' | 'c_reference' | 'c_snippets' | 'ts_snippets' | 'c_source'>('architecture');
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
 
   if (!isOpen) return null;
@@ -25,6 +25,115 @@ export const ArchitectureModal: React.FC<ArchitectureModalProps> = ({
     setCopiedKey(key);
     setTimeout(() => setCopiedKey(null), 2000);
   };
+
+  const C_REFERENCE_FOUNDATION = `/* =========================================================================
+ * Reference Implementation (Core C Battle Simulation Loop)
+ * ========================================================================= */
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include <stdbool.h>
+
+#define MAX_UNITS 100
+#define ARENA_WIDTH 800.0f
+#define ARENA_HEIGHT 600.0f
+
+typedef enum {
+    UNIT_SQUARE,   // Melee foot soldier
+    UNIT_TRIANGLE  // Ranged archer
+} UnitType;
+
+typedef enum {
+    TEAM_PLAYER,
+    TEAM_ENEMY
+} Team;
+
+typedef struct {
+    int id;
+    Team team;
+    UnitType type;
+    float x, y;         
+    float health;       
+    float damage;       
+    float range;        
+    float speed;        
+    bool is_alive;
+} Unit;
+
+typedef struct {
+    Unit units[MAX_UNITS];
+    int count;
+} Army;
+
+float get_distance(float x1, float y1, float x2, float y2) {
+    float dx = x2 - x1;
+    float dy = y2 - y1;
+    return sqrtf(dx * dx + dy * dy);
+}
+
+Unit* find_nearest_enemy(Unit* current_unit, Army* enemy_army) {
+    Unit* nearest = NULL;
+    float min_dist = 99999.0f;
+
+    for (int i = 0; i < enemy_army->count; i++) {
+        Unit* enemy = &enemy_army->units[i];
+        if (!enemy->is_alive) continue;
+
+        float dist = get_distance(current_unit->x, current_unit->y, enemy->x, enemy->y);
+        if (dist < min_dist) {
+            min_dist = dist;
+            nearest = enemy;
+        }
+    }
+    return nearest;
+}
+
+void update_unit(Unit* unit, Army* enemy_army, float dt) {
+    if (!unit->is_alive) return;
+
+    Unit* target = find_nearest_enemy(unit, enemy_army);
+    if (!target) return; 
+
+    float dist = get_distance(unit->x, unit->y, target->x, target->y);
+
+    if (dist <= unit->range) {
+        target->health -= unit->damage * dt;
+        if (target->health <= 0.0f) {
+            target->is_alive = false;
+        }
+    } else {
+        float dx = target->x - unit->x;
+        float dy = target->y - unit->y;
+        float length = sqrtf(dx * dx + dy * dy);
+        if (length > 0.0f) {
+            unit->x += (dx / length) * unit->speed * dt;
+            unit->y += (dy / length) * unit->speed * dt;
+        }
+    }
+}
+
+bool has_army_lost(Army* army) {
+    for (int i = 0; i < army->count; i++) {
+        if (army->units[i].is_alive) {
+            return false; 
+        }
+    }
+    return true; 
+}
+
+int simulate_battle_step(Army* player_army, Army* enemy_army, float dt) {
+    for (int i = 0; i < player_army->count; i++) {
+        update_unit(&player_army->units[i], enemy_army, dt);
+    }
+    for (int i = 0; i < enemy_army->count; i++) {
+        update_unit(&enemy_army->units[i], player_army, dt);
+    }
+
+    if (has_army_lost(player_army)) return 2; // Enemy wins
+    if (has_army_lost(enemy_army)) return 1;  // Player wins
+
+    return 0; // Ongoing
+}`;
 
   const ARCHITECTURE_EXPLANATION = `
 ================================================================================
@@ -289,6 +398,18 @@ const handleAttackClick = () => {
           </button>
 
           <button
+            onClick={() => setActiveTab('c_reference')}
+            className={`px-3 py-2 text-xs font-mono font-bold rounded-t-lg transition-colors cursor-pointer flex items-center gap-1.5 border-b-2 ${
+              activeTab === 'c_reference'
+                ? 'border-emerald-400 text-emerald-300 bg-slate-800/60'
+                : 'border-transparent text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <Code2 className="w-3.5 h-3.5 text-emerald-400" />
+            <span>Reference C Foundation</span>
+          </button>
+
+          <button
             onClick={() => setActiveTab('c_snippets')}
             className={`px-3 py-2 text-xs font-mono font-bold rounded-t-lg transition-colors cursor-pointer flex items-center gap-1.5 border-b-2 ${
               activeTab === 'c_snippets'
@@ -296,8 +417,8 @@ const handleAttackClick = () => {
                 : 'border-transparent text-slate-400 hover:text-slate-200'
             }`}
           >
-            <Code2 className="w-3.5 h-3.5" />
-            <span>C Core Code Snippets</span>
+            <Layers className="w-3.5 h-3.5" />
+            <span>Extended C Architecture</span>
           </button>
 
           <button
@@ -327,6 +448,33 @@ const handleAttackClick = () => {
 
         {/* Content Body */}
         <div className="flex-1 p-6 overflow-y-auto font-mono text-xs">
+          
+          {/* TAB: Reference C Foundation */}
+          {activeTab === 'c_reference' && (
+            <div className="flex flex-col gap-4">
+              <div className="flex items-center justify-between">
+                <div>
+                  <span className="text-xs text-emerald-400 font-bold uppercase tracking-wider block">
+                    Core C Battle Simulation Loop (Reference Specification)
+                  </span>
+                  <span className="text-[11px] text-slate-400">
+                    The foundational entity structures, distance math, target acquisition, and tick updates.
+                  </span>
+                </div>
+                <button
+                  onClick={() => copyToClipboard(C_REFERENCE_FOUNDATION, 'c_ref')}
+                  className="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 text-emerald-300 text-xs flex items-center gap-1 cursor-pointer transition-colors"
+                >
+                  {copiedKey === 'c_ref' ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+                  <span>{copiedKey === 'c_ref' ? 'Copied!' : 'Copy C Foundation'}</span>
+                </button>
+              </div>
+
+              <pre className="p-4 rounded-xl bg-slate-950 border border-slate-800 text-emerald-300 whitespace-pre font-mono leading-relaxed overflow-x-auto">
+                {C_REFERENCE_FOUNDATION}
+              </pre>
+            </div>
+          )}
           
           {/* TAB 1: Architecture & Memory Map */}
           {activeTab === 'architecture' && (
